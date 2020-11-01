@@ -41,6 +41,7 @@
 #include <limits.h>
 #include <termios.h>
 #include <ctype.h>
+#include <sys/wait.h>
 
 #include <curl/curl.h>
 #include <tox/tox.h>
@@ -448,39 +449,65 @@ static int password_prompt(char *buf, int size)
 /* Get the password from the eval command.
  * return length of password on success, 0 on failure
  */
-static int password_eval(char *buf, int size)
+static int password_eval(char *buf, size_t size)
 {
+    if (size == 0) {
+        return 0;
+    }
+
     buf[0] = '\0';
+    int pfd[2];
 
-    /* Run password_eval command */
-    FILE *f = popen(user_settings->password_eval, "r");
-
-    if (f == NULL) {
-        fprintf(stderr, "Executing password_eval failed\n");
+    if (pipe(pfd) == -1) {
+        fprintf(stderr, "pipe() failed in password_eval() (errno: %d)\n", errno);
         return 0;
     }
 
-    /* Get output from command */
-    char *ret = fgets(buf, size, f);
+    pid_t pid = fork();
 
-    if (ret == NULL) {
-        fprintf(stderr, "Reading password from password_eval command failed\n");
-        pclose(f);
+    // child process executes custom command and writes output to stdout
+    if (pid == 0) {
+        close(pfd[0]);
+        dup2(pfd[1], STDOUT_FILENO);
+
+        if (execl(user_settings->password_eval, user_settings->password_eval, NULL) == -1) {
+            fprintf(stderr, "execl() failed in password_eval() (errno: %d)\n", errno);
+            kill(pid, SIGKILL);
+        }
+
+        char *tmp = malloc(size);
+
+        if (tmp == NULL) {
+            fprintf(stderr, "password_eval() failed: Out of memory\n");
+            kill(pid, SIGKILL);
+        }
+
+        char *ret = fgets(tmp, size, stdout);
+
+        if (ret == NULL) {
+            fprintf(stderr, "Reading password from password_eval command failed (errno: %d)\n", errno);
+            free(tmp);
+            kill(pid, SIGKILL);
+        }
+
+        write(pfd[1], tmp, strlen(tmp) + 1);
+        free(tmp);
+    } else {
+        close(pfd[1]);
+    }
+
+    wait(&pid);
+
+    read(pfd[0], buf, size);
+
+    size_t len = strlen(buf);
+
+    if (len == 0) {
         return 0;
     }
 
-    /* Get exit status */
-    int status = pclose(f);
-
-    if (status != 0) {
-        fprintf(stderr, "password_eval command returned error %d\n", status);
-        return 0;
-    }
-
-    /* Removez whitespace or \n at end */
-    int i, len = strlen(buf);
-
-    for (i = len - 1; i > 0 && isspace(buf[i]); i--) {
+    /* Remove whitespace or \n at end */
+    for (size_t i = len - 1; i > 0 && isspace(buf[i]); i--) {
         buf[i] = 0;
         len--;
     }
